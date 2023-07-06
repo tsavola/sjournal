@@ -2,189 +2,59 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package slog
+package sjournal
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
-	"io"
-	"log/slog/internal/buffer"
+	"log/slog"
+	"net"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync"
-	"time"
 )
 
-// A Handler handles log records produced by a Logger..
-//
-// A typical handler may print log records to standard error,
-// or write them to a file or database, or perhaps augment them
-// with additional attributes and pass them on to another handler.
-//
-// Any of the Handler's methods may be called concurrently with itself
-// or with other methods. It is the responsibility of the Handler to
-// manage this concurrency.
-//
-// Users of the slog package should not invoke Handler methods directly.
-// They should use the methods of [Logger] instead.
-type Handler interface {
-	// Enabled reports whether the handler handles records at the given level.
-	// The handler ignores records whose level is lower.
-	// It is called early, before any arguments are processed,
-	// to save effort if the log event should be discarded.
-	// If called from a Logger method, the first argument is the context
-	// passed to that method, or context.Background() if nil was passed
-	// or the method does not take a context.
-	// The context is passed so Enabled can use its values
-	// to make a decision.
-	Enabled(context.Context, Level) bool
+var defaultSocket = "/run/systemd/journal/socket"
 
-	// Handle handles the Record.
-	// It will only be called when Enabled returns true.
-	// The Context argument is as for Enabled.
-	// It is present solely to provide Handlers access to the context's values.
-	// Canceling the context should not affect record processing.
-	// (Among other things, log messages may be necessary to debug a
-	// cancellation-related problem.)
-	//
-	// Handle methods that produce output should observe the following rules:
-	//   - If r.Time is the zero time, ignore the time.
-	//   - If r.PC is zero, ignore it.
-	//   - Attr's values should be resolved.
-	//   - If an Attr's key and value are both the zero value, ignore the Attr.
-	//     This can be tested with attr.Equal(Attr{}).
-	//   - If a group's key is empty, inline the group's Attrs.
-	//   - If a group has no Attrs (even if it has a non-empty key),
-	//     ignore it.
-	Handle(context.Context, Record) error
-
-	// WithAttrs returns a new Handler whose attributes consist of
-	// both the receiver's attributes and the arguments.
-	// The Handler owns the slice: it may retain, modify or discard it.
-	WithAttrs(attrs []Attr) Handler
-
-	// WithGroup returns a new Handler with the given group appended to
-	// the receiver's existing groups.
-	// The keys of all subsequent attributes, whether added by With or in a
-	// Record, should be qualified by the sequence of group names.
-	//
-	// How this qualification happens is up to the Handler, so long as
-	// this Handler's attribute keys differ from those of another Handler
-	// with a different sequence of group names.
-	//
-	// A Handler should treat WithGroup as starting a Group of Attrs that ends
-	// at the end of the log event. That is,
-	//
-	//     logger.WithGroup("s").LogAttrs(level, msg, slog.Int("a", 1), slog.Int("b", 2))
-	//
-	// should behave like
-	//
-	//     logger.LogAttrs(level, msg, slog.Group("s", slog.Int("a", 1), slog.Int("b", 2)))
-	//
-	// If the name is empty, WithGroup returns the receiver.
-	WithGroup(name string) Handler
-}
-
-type defaultHandler struct {
-	ch *commonHandler
-	// internal.DefaultOutput, except for testing
-	output func(pc uintptr, data []byte) error
-}
-
-func newDefaultHandler(output func(uintptr, []byte) error) *defaultHandler {
-	return &defaultHandler{
-		ch:     &commonHandler{json: false},
-		output: output,
-	}
-}
-
-func (*defaultHandler) Enabled(_ context.Context, l Level) bool {
-	return l >= LevelInfo
-}
-
-// Collect the level, attributes and message in a string and
-// write it with the default log.Logger.
-// Let the log.Logger handle time and file/line.
-func (h *defaultHandler) Handle(ctx context.Context, r Record) error {
-	buf := buffer.New()
-	buf.WriteString(r.Level.String())
-	buf.WriteByte(' ')
-	buf.WriteString(r.Message)
-	state := h.ch.newHandleState(buf, true, " ")
-	defer state.free()
-	state.appendNonBuiltIns(r)
-	return h.output(r.PC, *buf)
-}
-
-func (h *defaultHandler) WithAttrs(as []Attr) Handler {
-	return &defaultHandler{h.ch.withAttrs(as), h.output}
-}
-
-func (h *defaultHandler) WithGroup(name string) Handler {
-	return &defaultHandler{h.ch.withGroup(name), h.output}
-}
-
-// HandlerOptions are options for a TextHandler or JSONHandler.
-// A zero HandlerOptions consists entirely of default values.
 type HandlerOptions struct {
-	// AddSource causes the handler to compute the source code position
-	// of the log statement and add a SourceKey attribute to the output.
-	AddSource bool
-
 	// Level reports the minimum record level that will be logged.
 	// The handler discards records with lower levels.
-	// If Level is nil, the handler assumes LevelInfo.
+	// If Level is nil, the handler assumes LevelDebug.
 	// The handler calls Level.Level for each record processed;
 	// to adjust the minimum level dynamically, use a LevelVar.
-	Level Leveler
+	Level slog.Leveler
 
-	// ReplaceAttr is called to rewrite each non-group attribute before it is logged.
-	// The attribute's value has been resolved (see [Value.Resolve]).
-	// If ReplaceAttr returns an Attr with Key == "", the attribute is discarded.
-	//
-	// The built-in attributes with keys "time", "level", "source", and "msg"
-	// are passed to this function, except that time is omitted
-	// if zero, and source is omitted if AddSource is false.
-	//
-	// The first argument is a list of currently open groups that contain the
-	// Attr. It must not be retained or modified. ReplaceAttr is never called
-	// for Group attributes, only their contents. For example, the attribute
-	// list
-	//
-	//     Int("a", 1), Group("g", Int("b", 2)), Int("c", 3)
-	//
-	// results in consecutive calls to ReplaceAttr with the following arguments:
-	//
-	//     nil, Int("a", 1)
-	//     []string{"g"}, Int("b", 2)
-	//     nil, Int("c", 3)
-	//
-	// ReplaceAttr can be used to change the default keys of the built-in
-	// attributes, convert types (for example, to replace a `time.Time` with the
-	// integer seconds since the Unix epoch), sanitize personal information, or
-	// remove attributes from the output.
-	ReplaceAttr func(groups []string, a Attr) Attr
+	Socket string
 }
 
-// Keys for "built-in" attributes.
-const (
-	// TimeKey is the key used by the built-in handlers for the time
-	// when the log method is called. The associated Value is a [time.Time].
-	TimeKey = "time"
-	// LevelKey is the key used by the built-in handlers for the level
-	// of the log call. The associated value is a [Level].
-	LevelKey = "level"
-	// MessageKey is the key used by the built-in handlers for the
-	// message of the log call. The associated value is a string.
-	MessageKey = "msg"
-	// SourceKey is the key used by the built-in handlers for the source file
-	// and line of the log call. The associated value is a string.
-	SourceKey = "source"
-)
+func NewHandler(opts *HandlerOptions) (*Handler, error) {
+	sock, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Net: "unixgram"})
+	if err != nil {
+		return nil, err
+	}
 
-type commonHandler struct {
-	json              bool // true => output JSON; false => output text
-	opts              HandlerOptions
+	h := &Handler{
+		sock: sock,
+		addr: net.UnixAddr{
+			Net:  "unixgram",
+			Name: defaultSocket,
+		},
+	}
+
+	if opts != nil {
+		h.level = opts.Level
+		if opts.Socket != "" {
+			h.addr.Name = opts.Socket
+		}
+	}
+
+	return h, nil
+}
+
+type Handler struct {
+	level             slog.Leveler
 	preformattedAttrs []byte
 	// groupPrefix is for the text handler only.
 	// It holds the prefix for groups that were already pre-formatted.
@@ -193,41 +63,33 @@ type commonHandler struct {
 	groupPrefix string
 	groups      []string // all groups started from WithGroup
 	nOpenGroups int      // the number of groups opened in preformattedAttrs
-	mu          sync.Mutex
-	w           io.Writer
+	sock        *net.UnixConn
+	addr        net.UnixAddr
 }
 
-func (h *commonHandler) clone() *commonHandler {
-	// We can't use assignment because we can't copy the mutex.
-	return &commonHandler{
-		json:              h.json,
-		opts:              h.opts,
-		preformattedAttrs: slices.Clip(h.preformattedAttrs),
-		groupPrefix:       h.groupPrefix,
-		groups:            slices.Clip(h.groups),
-		nOpenGroups:       h.nOpenGroups,
-		w:                 h.w,
-	}
-}
-
-// enabled reports whether l is greater than or equal to the
-// minimum level.
-func (h *commonHandler) enabled(l Level) bool {
-	minLevel := LevelInfo
-	if h.opts.Level != nil {
-		minLevel = h.opts.Level.Level()
+func (h *Handler) Enabled(ctx context.Context, l slog.Level) bool {
+	minLevel := slog.LevelDebug
+	if h.level != nil {
+		minLevel = h.level.Level()
 	}
 	return l >= minLevel
 }
 
-func (h *commonHandler) withAttrs(as []Attr) *commonHandler {
+func (h *Handler) clone() *Handler {
+	h2 := *h
+	h2.preformattedAttrs = slices.Clip(h.preformattedAttrs)
+	h2.groups = slices.Clip(h.groups)
+	return &h2
+}
+
+func (h *Handler) WithAttrs(as []slog.Attr) slog.Handler {
 	h2 := h.clone()
 	// Pre-format the attributes as an optimization.
-	state := h2.newHandleState((*buffer.Buffer)(&h2.preformattedAttrs), false, "")
+	state := h2.newHandleState((*buffer)(&h2.preformattedAttrs), false, "")
 	defer state.free()
 	state.prefix.WriteString(h.groupPrefix)
 	if len(h2.preformattedAttrs) > 0 {
-		state.sep = h.attrSep()
+		state.sep = " "
 	}
 	state.openGroups()
 	for _, a := range as {
@@ -241,136 +103,129 @@ func (h *commonHandler) withAttrs(as []Attr) *commonHandler {
 	return h2
 }
 
-func (h *commonHandler) withGroup(name string) *commonHandler {
+func (h *Handler) WithGroup(name string) slog.Handler {
 	h2 := h.clone()
 	h2.groups = append(h2.groups, name)
 	return h2
 }
 
-func (h *commonHandler) handle(r Record) error {
-	state := h.newHandleState(buffer.New(), true, "")
-	defer state.free()
-	if h.json {
-		state.buf.WriteByte('{')
-	}
-	// Built-in attributes. They are not in a group.
-	stateGroups := state.groups
-	state.groups = nil // So ReplaceAttrs sees no groups instead of the pre groups.
-	rep := h.opts.ReplaceAttr
-	// time
-	if !r.Time.IsZero() {
-		key := TimeKey
-		val := r.Time.Round(0) // strip monotonic to match Attr behavior
-		if rep == nil {
-			state.appendKey(key)
-			state.appendTime(val)
-		} else {
-			state.appendAttr(Time(key, val))
-		}
-	}
-	// level
-	key := LevelKey
-	val := r.Level
-	if rep == nil {
-		state.appendKey(key)
-		state.appendString(val.String())
-	} else {
-		state.appendAttr(Any(key, val))
-	}
-	// source
-	if h.opts.AddSource {
-		state.appendAttr(Any(SourceKey, r.source()))
-	}
-	key = MessageKey
-	msg := r.Message
-	if rep == nil {
-		state.appendKey(key)
-		state.appendString(msg)
-	} else {
-		state.appendAttr(String(key, msg))
-	}
-	state.groups = stateGroups // Restore groups passed to ReplaceAttrs.
-	state.appendNonBuiltIns(r)
-	state.buf.WriteByte('\n')
+const (
+	prefixEmerg   = "PRIORITY=0\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
+	prefixAlert   = "PRIORITY=1\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
+	prefixCrit    = "PRIORITY=2\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
+	prefixErr     = "PRIORITY=3\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
+	prefixWarning = "PRIORITY=4\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
+	prefixNotice  = "PRIORITY=5\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
+	prefixInfo    = "PRIORITY=6\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
+	prefixDebug   = "PRIORITY=7\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	_, err := h.w.Write(*state.buf)
-	return err
+	prefixOffsetSize = 19
+)
+
+var priorityPrefixes = [...]string{
+	// Lower levels are prefixDebug (if enabled).
+	prefixDebug, // LevelDebug
+	prefixInfo,
+	prefixInfo,
+	prefixInfo,
+	prefixInfo,    // LevelInfo
+	prefixNotice,  // LevelInfo + 1
+	prefixNotice,  // LevelNotice
+	prefixNotice,  // LevelWarn - 1
+	prefixWarning, // LevelWarn
+	prefixErr,
+	prefixErr,
+	prefixErr,
+	prefixErr,  // LevelError
+	prefixCrit, // LevelError + 1
+	prefixCrit,
+	prefixCrit,
+	prefixCrit, // LevelCrit
+	// Higher levels are prefixAlert.
 }
 
-func (s *handleState) appendNonBuiltIns(r Record) {
+var suffixCache sync.Map
+
+func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
+	var prefix string
+	var suffix string
+
+	switch i := int(r.Level.Level() - slog.LevelDebug); {
+	case i < 0:
+		prefix = prefixDebug
+	case i < len(priorityPrefixes):
+		prefix = priorityPrefixes[i]
+	default:
+		prefix = prefixAlert
+	}
+
+	if x, found := suffixCache.Load(r.PC); found {
+		suffix = x.(string)
+	} else {
+		f, _ := runtime.CallersFrames([]uintptr{r.PC}).Next()
+		suffix = fmt.Sprintf("\nCODE_FILE=%s\nCODE_LINE=%d\nCODE_FUNC=%s\n", f.File, f.Line, f.Function)
+		suffixCache.Store(r.PC, suffix)
+	}
+
+	state := h.newHandleState(newBuffer(), true, "")
+	defer state.free()
+
+	state.buf.WriteString(prefix)
+	state.buf.WriteString(r.Message)
+	state.sep = " "
+	state.appendNonBuiltIns(r)
+	state.buf.WriteString(suffix)
+
+	b := *state.buf
+	binary.LittleEndian.PutUint64(b[prefixOffsetSize:], uint64(len(b)-len(prefix)-len(suffix)))
+
+	if _, _, err := h.sock.WriteMsgUnix(b, nil, &h.addr); err != nil {
+		return h.sendViaFileIfTooLarge(err, b)
+	}
+	return nil
+}
+
+func (s *handleState) appendNonBuiltIns(r slog.Record) {
 	// preformatted Attrs
 	if len(s.h.preformattedAttrs) > 0 {
 		s.buf.WriteString(s.sep)
 		s.buf.Write(s.h.preformattedAttrs)
-		s.sep = s.h.attrSep()
+		s.sep = " "
 	}
 	// Attrs in Record -- unlike the built-in ones, they are in groups started
 	// from WithGroup.
 	s.prefix.WriteString(s.h.groupPrefix)
 	s.openGroups()
-	r.Attrs(func(a Attr) bool {
+	r.Attrs(func(a slog.Attr) bool {
 		s.appendAttr(a)
 		return true
 	})
-	if s.h.json {
-		// Close all open groups.
-		for range s.h.groups {
-			s.buf.WriteByte('}')
-		}
-		// Close the top-level object.
-		s.buf.WriteByte('}')
-	}
-}
-
-// attrSep returns the separator between attributes.
-func (h *commonHandler) attrSep() string {
-	if h.json {
-		return ","
-	}
-	return " "
 }
 
 // handleState holds state for a single call to commonHandler.handle.
 // The initial value of sep determines whether to emit a separator
 // before the next key, after which it stays true.
 type handleState struct {
-	h       *commonHandler
-	buf     *buffer.Buffer
-	freeBuf bool           // should buf be freed?
-	sep     string         // separator to write before next key
-	prefix  *buffer.Buffer // for text: key prefix
-	groups  *[]string      // pool-allocated slice of active groups, for ReplaceAttr
+	h       *Handler
+	buf     *buffer
+	freeBuf bool    // should buf be freed?
+	sep     string  // separator to write before next key
+	prefix  *buffer // for text: key prefix
 }
 
-var groupPool = sync.Pool{New: func() any {
-	s := make([]string, 0, 10)
-	return &s
-}}
-
-func (h *commonHandler) newHandleState(buf *buffer.Buffer, freeBuf bool, sep string) handleState {
-	s := handleState{
+func (h *Handler) newHandleState(buf *buffer, freeBuf bool, sep string) handleState {
+	return handleState{
 		h:       h,
 		buf:     buf,
 		freeBuf: freeBuf,
 		sep:     sep,
-		prefix:  buffer.New(),
+		prefix:  newBuffer(),
 	}
-	if h.opts.ReplaceAttr != nil {
-		s.groups = groupPool.Get().(*[]string)
-		*s.groups = append(*s.groups, h.groups[:h.nOpenGroups]...)
-	}
-	return s
 }
 
 func (s *handleState) free() {
 	if s.freeBuf {
 		s.buf.Free()
-	}
-	if gs := s.groups; gs != nil {
-		*gs = (*gs)[:0]
-		groupPool.Put(gs)
 	}
 	s.prefix.Free()
 }
@@ -387,62 +242,32 @@ const keyComponentSep = '.'
 // openGroup starts a new group of attributes
 // with the given name.
 func (s *handleState) openGroup(name string) {
-	if s.h.json {
-		s.appendKey(name)
-		s.buf.WriteByte('{')
-		s.sep = ""
-	} else {
-		s.prefix.WriteString(name)
-		s.prefix.WriteByte(keyComponentSep)
-	}
-	// Collect group names for ReplaceAttr.
-	if s.groups != nil {
-		*s.groups = append(*s.groups, name)
-	}
+	s.prefix.WriteString(name)
+	s.prefix.WriteByte(keyComponentSep)
 }
 
 // closeGroup ends the group with the given name.
 func (s *handleState) closeGroup(name string) {
-	if s.h.json {
-		s.buf.WriteByte('}')
-	} else {
-		(*s.prefix) = (*s.prefix)[:len(*s.prefix)-len(name)-1 /* for keyComponentSep */]
-	}
-	s.sep = s.h.attrSep()
-	if s.groups != nil {
-		*s.groups = (*s.groups)[:len(*s.groups)-1]
-	}
+	(*s.prefix) = (*s.prefix)[:len(*s.prefix)-len(name)-1 /* for keyComponentSep */]
+	s.sep = " "
 }
 
 // appendAttr appends the Attr's key and value using app.
 // It handles replacement and checking for an empty key.
 // after replacement).
-func (s *handleState) appendAttr(a Attr) {
-	if rep := s.h.opts.ReplaceAttr; rep != nil && a.Value.Kind() != KindGroup {
-		var gs []string
-		if s.groups != nil {
-			gs = *s.groups
-		}
-		// Resolve before calling ReplaceAttr, so the user doesn't have to.
-		a.Value = a.Value.Resolve()
-		a = rep(gs, a)
-	}
+func (s *handleState) appendAttr(a slog.Attr) {
 	a.Value = a.Value.Resolve()
 	// Elide empty Attrs.
-	if a.isEmpty() {
+	if a.Equal(slog.Attr{}) {
 		return
 	}
 	// Special case: Source.
-	if v := a.Value; v.Kind() == KindAny {
-		if src, ok := v.Any().(*Source); ok {
-			if s.h.json {
-				a.Value = src.group()
-			} else {
-				a.Value = StringValue(fmt.Sprintf("%s:%d", src.File, src.Line))
-			}
+	if v := a.Value; v.Kind() == slog.KindAny {
+		if src, ok := v.Any().(*slog.Source); ok {
+			a.Value = slog.StringValue(fmt.Sprintf("%s:%d", src.File, src.Line))
 		}
 	}
-	if a.Value.Kind() == KindGroup {
+	if a.Value.Kind() == slog.KindGroup {
 		attrs := a.Value.Group()
 		// Output only non-empty groups.
 		if len(attrs) > 0 {
@@ -459,12 +284,8 @@ func (s *handleState) appendAttr(a Attr) {
 		}
 	} else {
 		s.appendKey(a.Key)
-		s.appendValue(a.Value)
+		s.appendString(a.Value.String())
 	}
-}
-
-func (s *handleState) appendError(err error) {
-	s.appendString(fmt.Sprintf("!ERROR:%v", err))
 }
 
 func (s *handleState) appendKey(key string) {
@@ -475,80 +296,14 @@ func (s *handleState) appendKey(key string) {
 	} else {
 		s.appendString(key)
 	}
-	if s.h.json {
-		s.buf.WriteByte(':')
-	} else {
-		s.buf.WriteByte('=')
-	}
-	s.sep = s.h.attrSep()
+	s.buf.WriteByte('=')
+	s.sep = " "
 }
 
 func (s *handleState) appendString(str string) {
-	if s.h.json {
-		s.buf.WriteByte('"')
-		*s.buf = appendEscapedJSONString(*s.buf, str)
-		s.buf.WriteByte('"')
+	if needsQuoting(str) {
+		*s.buf = strconv.AppendQuote(*s.buf, str)
 	} else {
-		// text
-		if needsQuoting(str) {
-			*s.buf = strconv.AppendQuote(*s.buf, str)
-		} else {
-			s.buf.WriteString(str)
-		}
-	}
-}
-
-func (s *handleState) appendValue(v Value) {
-	var err error
-	if s.h.json {
-		err = appendJSONValue(s, v)
-	} else {
-		err = appendTextValue(s, v)
-	}
-	if err != nil {
-		s.appendError(err)
-	}
-}
-
-func (s *handleState) appendTime(t time.Time) {
-	if s.h.json {
-		appendJSONTime(s, t)
-	} else {
-		writeTimeRFC3339Millis(s.buf, t)
-	}
-}
-
-// This takes half the time of Time.AppendFormat.
-func writeTimeRFC3339Millis(buf *buffer.Buffer, t time.Time) {
-	year, month, day := t.Date()
-	buf.WritePosIntWidth(year, 4)
-	buf.WriteByte('-')
-	buf.WritePosIntWidth(int(month), 2)
-	buf.WriteByte('-')
-	buf.WritePosIntWidth(day, 2)
-	buf.WriteByte('T')
-	hour, min, sec := t.Clock()
-	buf.WritePosIntWidth(hour, 2)
-	buf.WriteByte(':')
-	buf.WritePosIntWidth(min, 2)
-	buf.WriteByte(':')
-	buf.WritePosIntWidth(sec, 2)
-	ns := t.Nanosecond()
-	buf.WriteByte('.')
-	buf.WritePosIntWidth(ns/1e6, 3)
-	_, offsetSeconds := t.Zone()
-	if offsetSeconds == 0 {
-		buf.WriteByte('Z')
-	} else {
-		offsetMinutes := offsetSeconds / 60
-		if offsetMinutes < 0 {
-			buf.WriteByte('-')
-			offsetMinutes = -offsetMinutes
-		} else {
-			buf.WriteByte('+')
-		}
-		buf.WritePosIntWidth(offsetMinutes/60, 2)
-		buf.WriteByte(':')
-		buf.WritePosIntWidth(offsetMinutes%60, 2)
+		s.buf.WriteString(str)
 	}
 }
