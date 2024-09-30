@@ -48,3 +48,7 @@ func (b *buffer) WriteByte(c byte) error {
 func (b *buffer) String() string {
 	return string(*b)
 }
+
+func (b *buffer) Len() int {
+	return len(*b)
+}

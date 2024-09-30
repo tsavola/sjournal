@@ -118,8 +118,6 @@ const (
 	prefixNotice  = "PRIORITY=5\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
 	prefixInfo    = "PRIORITY=6\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
 	prefixDebug   = "PRIORITY=7\nMESSAGE\n\x00\x00\x00\x00\x00\x00\x00\x00"
-
-	prefixOffsetSize = 19
 )
 
 var priorityPrefixes = [...]string{
@@ -171,13 +169,20 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	defer state.free()
 
 	state.buf.WriteString(prefix)
+	messageOffset := state.buf.Len()
 	state.buf.WriteString(r.Message)
 	state.sep = ": "
 	state.appendNonBuiltIns(r)
+	messageLen := state.buf.Len() - messageOffset
 	state.buf.WriteString(suffix)
+	if !r.Time.IsZero() {
+		state.buf.WriteString("SYSLOG_TIMESTAMP=")
+		*state.buf = strconv.AppendInt(*state.buf, r.Time.Unix(), 10)
+		state.buf.WriteByte('\n')
+	}
 
 	b := *state.buf
-	binary.LittleEndian.PutUint64(b[prefixOffsetSize:], uint64(len(b)-len(prefix)-len(suffix)))
+	binary.LittleEndian.PutUint64(b[messageOffset-8:], uint64(messageLen))
 
 	if _, _, err := h.sock.WriteMsgUnix(b, nil, &h.addr); err != nil {
 		return h.sendViaFileIfTooLarge(err, b)
