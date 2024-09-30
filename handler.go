@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 )
 
 var defaultSocket = "/run/systemd/journal/socket"
@@ -25,6 +26,9 @@ type HandlerOptions struct {
 	// The handler calls Level.Level for each record processed;
 	// to adjust the minimum level dynamically, use a LevelVar.
 	Level slog.Leveler
+
+	// TimeFormat for attribute values.  Defaults to [time.RFC3339Nano].
+	TimeFormat string
 
 	Socket string
 }
@@ -41,12 +45,16 @@ func NewHandler(opts *HandlerOptions) (*Handler, error) {
 			Net:  "unixgram",
 			Name: defaultSocket,
 		},
+		timeFormat: time.RFC3339Nano,
 	}
 
 	if opts != nil {
 		h.level = opts.Level
 		if opts.Socket != "" {
 			h.addr.Name = opts.Socket
+		}
+		if opts.TimeFormat != "" {
+			h.timeFormat = opts.TimeFormat
 		}
 	}
 
@@ -65,6 +73,7 @@ type Handler struct {
 	nOpenGroups int      // the number of groups opened in preformattedAttrs
 	sock        *net.UnixConn
 	addr        net.UnixAddr
+	timeFormat  string
 }
 
 func (h *Handler) Enabled(ctx context.Context, l slog.Level) bool {
@@ -266,11 +275,14 @@ func (s *handleState) appendAttr(a slog.Attr) {
 	if a.Equal(slog.Attr{}) {
 		return
 	}
-	// Special case: Source.
-	if v := a.Value; v.Kind() == slog.KindAny {
+	// Special cases.
+	switch v := a.Value; v.Kind() {
+	case slog.KindAny:
 		if src, ok := v.Any().(*slog.Source); ok {
 			a.Value = slog.StringValue(fmt.Sprintf("%s:%d", src.File, src.Line))
 		}
+	case slog.KindTime:
+		a.Value = slog.StringValue(a.Value.Time().Format(s.h.timeFormat))
 	}
 	if a.Value.Kind() == slog.KindGroup {
 		attrs := a.Value.Group()
