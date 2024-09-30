@@ -172,7 +172,7 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 
 	state.buf.WriteString(prefix)
 	state.buf.WriteString(r.Message)
-	state.sep = " "
+	state.sep = ": "
 	state.appendNonBuiltIns(r)
 	state.buf.WriteString(suffix)
 
@@ -204,7 +204,7 @@ func (s *handleState) appendNonBuiltIns(r slog.Record) {
 
 // handleState holds state for a single call to commonHandler.handle.
 // The initial value of sep determines whether to emit a separator
-// before the next key, after which it stays true.
+// before the next key, after which it stays non-empty.
 type handleState struct {
 	h       *Handler
 	buf     *buffer
