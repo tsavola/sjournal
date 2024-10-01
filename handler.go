@@ -27,6 +27,9 @@ type HandlerOptions struct {
 	// to adjust the minimum level dynamically, use a LevelVar.
 	Level slog.Leveler
 
+	// Prefix is prepended to message strings.
+	Prefix string
+
 	// TimeFormat for attribute values.  Defaults to [time.RFC3339Nano].
 	TimeFormat string
 
@@ -56,6 +59,7 @@ func NewHandler(opts *HandlerOptions) (*Handler, error) {
 		if opts.TimeFormat != "" {
 			h.timeFormat = opts.TimeFormat
 		}
+		h.msgPrefix = opts.Prefix
 	}
 
 	return h, nil
@@ -74,6 +78,13 @@ type Handler struct {
 	sock        *net.UnixConn
 	addr        net.UnixAddr
 	timeFormat  string
+	msgPrefix   string
+}
+
+func (h *Handler) ExtendPrefix(s string) slog.Handler {
+	h2 := h.clone()
+	h2.msgPrefix = h.msgPrefix + s
+	return h2
 }
 
 func (h *Handler) Enabled(ctx context.Context, l slog.Level) bool {
@@ -179,6 +190,7 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 
 	state.buf.WriteString(prefix)
 	messageOffset := state.buf.Len()
+	state.buf.WriteString(h.msgPrefix)
 	state.buf.WriteString(r.Message)
 	state.sep = ": "
 	state.appendNonBuiltIns(r)
