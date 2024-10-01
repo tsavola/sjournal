@@ -9,10 +9,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +31,8 @@ type HandlerOptions struct {
 
 	// Prefix is prepended to message strings.
 	Prefix string
+
+	IgnoreAttrs []string
 
 	// TimeFormat for attribute values.  Defaults to [time.RFC3339Nano].
 	TimeFormat string
@@ -60,9 +64,15 @@ func NewHandler(opts *HandlerOptions) (*Handler, error) {
 			h.timeFormat = opts.TimeFormat
 		}
 		h.msgPrefix = opts.Prefix
+		h.addIgnore(opts.IgnoreAttrs)
 	}
 
 	return h, nil
+}
+
+type ignoreKey struct {
+	prefix string // Until last dot.
+	key    string
 }
 
 type Handler struct {
@@ -79,12 +89,35 @@ type Handler struct {
 	addr        net.UnixAddr
 	timeFormat  string
 	msgPrefix   string
+	ignore      map[ignoreKey]struct{}
 }
 
-func (h *Handler) ExtendPrefix(s string) slog.Handler {
+func (h *Handler) ExtendPrefix(s string) *Handler {
 	h2 := h.clone()
 	h2.msgPrefix = h.msgPrefix + s
 	return h2
+}
+
+func (h *Handler) IgnoreAttrs(keys ...string) *Handler {
+	h2 := h.clone()
+	h2.addIgnore(keys)
+	return h2
+}
+
+func (h *Handler) addIgnore(keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	if h.ignore == nil {
+		h.ignore = make(map[ignoreKey]struct{}, len(keys))
+	}
+	for _, s := range keys {
+		if i := strings.LastIndexByte(s, '.'); i >= 0 {
+			h.ignore[ignoreKey{s[:i+1], s[i+1:]}] = struct{}{}
+		} else {
+			h.ignore[ignoreKey{"", s}] = struct{}{}
+		}
+	}
 }
 
 func (h *Handler) Enabled(ctx context.Context, l slog.Level) bool {
@@ -99,6 +132,7 @@ func (h *Handler) clone() *Handler {
 	h2 := *h
 	h2.preformattedAttrs = slices.Clip(h.preformattedAttrs)
 	h2.groups = slices.Clip(h.groups)
+	h2.ignore = maps.Clone(h.ignore)
 	return &h2
 }
 
@@ -282,6 +316,14 @@ func (s *handleState) closeGroup(name string) {
 // It handles replacement and checking for an empty key.
 // after replacement).
 func (s *handleState) appendAttr(a slog.Attr) {
+	var prefix []byte
+	if s.prefix != nil {
+		prefix = *s.prefix
+	}
+	if _, ignore := s.h.ignore[ignoreKey{string(prefix), a.Key}]; ignore {
+		return
+	}
+
 	a.Value = a.Value.Resolve()
 	// Elide empty Attrs.
 	if a.Equal(slog.Attr{}) {
