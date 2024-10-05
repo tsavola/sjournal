@@ -78,8 +78,9 @@ func TestHandler(t *testing.T) {
 	}()
 
 	h, err := NewHandler(&HandlerOptions{
-		Level:  slog.LevelInfo,
-		Socket: sockPath,
+		Level:     slog.LevelInfo,
+		Delimiter: ColonDelimiter,
+		Socket:    sockPath,
 	})
 	if err != nil {
 		t.Fatal(err)

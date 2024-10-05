@@ -21,6 +21,11 @@ import (
 
 var defaultSocket = "/run/systemd/journal/socket"
 
+const (
+	DefaultDelimiter = " "
+	ColonDelimiter   = ": "
+)
+
 type HandlerOptions struct {
 	// Level reports the minimum record level that will be logged.
 	// The handler discards records with lower levels.
@@ -28,6 +33,10 @@ type HandlerOptions struct {
 	// The handler calls Level.Level for each record processed;
 	// to adjust the minimum level dynamically, use a LevelVar.
 	Level slog.Leveler
+
+	// Delimiter is inserted between message and attributes (if there are
+	// attributes).  It defaults to a space.
+	Delimiter string
 
 	// Prefix is prepended to message strings.
 	Prefix string
@@ -60,6 +69,7 @@ func NewHandler(opts *HandlerOptions) (*Handler, error) {
 		if opts.Socket != "" {
 			h.addr.Name = opts.Socket
 		}
+		h.delimiter = opts.Delimiter
 		if opts.TimeFormat != "" {
 			h.timeFormat = opts.TimeFormat
 		}
@@ -87,6 +97,7 @@ type Handler struct {
 	nOpenGroups int      // the number of groups opened in preformattedAttrs
 	sock        *net.UnixConn
 	addr        net.UnixAddr
+	delimiter   string
 	timeFormat  string
 	msgPrefix   string
 	ignore      map[ignoreKey]struct{}
@@ -226,7 +237,7 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 	messageOffset := state.buf.Len()
 	state.buf.WriteString(h.msgPrefix)
 	state.buf.WriteString(r.Message)
-	state.sep = ": "
+	state.sep = h.delimiter
 	state.appendNonBuiltIns(r)
 	messageLen := state.buf.Len() - messageOffset
 	state.buf.WriteString(suffix)
