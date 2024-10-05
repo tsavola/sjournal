@@ -1,5 +1,5 @@
 module import.name/sjournal
 
-go 1.21
+go 1.23
 
-require golang.org/x/sys v0.10.0
+require golang.org/x/sys v0.26.0
