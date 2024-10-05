@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 var defaultSocket = "/run/systemd/journal/socket"
@@ -43,7 +42,8 @@ type HandlerOptions struct {
 
 	IgnoreAttrs []string
 
-	// TimeFormat for attribute values.  Defaults to [time.RFC3339Nano].
+	// TimeFormat for attribute values.  Default is to use [time.Time.String]
+	// method.
 	TimeFormat string
 
 	Socket string
@@ -61,7 +61,6 @@ func NewHandler(opts *HandlerOptions) (*Handler, error) {
 			Net:  "unixgram",
 			Name: defaultSocket,
 		},
-		timeFormat: time.RFC3339Nano,
 	}
 
 	if opts != nil {
@@ -70,9 +69,7 @@ func NewHandler(opts *HandlerOptions) (*Handler, error) {
 			h.addr.Name = opts.Socket
 		}
 		h.delimiter = opts.Delimiter
-		if opts.TimeFormat != "" {
-			h.timeFormat = opts.TimeFormat
-		}
+		h.timeFormat = opts.TimeFormat
 		h.msgPrefix = opts.Prefix
 		h.addIgnore(opts.IgnoreAttrs)
 	}
@@ -347,7 +344,12 @@ func (s *handleState) appendAttr(a slog.Attr) {
 			a.Value = slog.StringValue(fmt.Sprintf("%s:%d", src.File, src.Line))
 		}
 	case slog.KindTime:
-		a.Value = slog.StringValue(a.Value.Time().Format(s.h.timeFormat))
+		t := a.Value.Time()
+		if s.h.timeFormat != "" {
+			a.Value = slog.StringValue(t.Format(s.h.timeFormat))
+		} else {
+			a.Value = slog.StringValue(t.String())
+		}
 	}
 	if a.Value.Kind() == slog.KindGroup {
 		attrs := a.Value.Group()
