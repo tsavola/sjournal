@@ -46,6 +46,12 @@ type HandlerOptions struct {
 	// method.
 	TimeFormat string
 
+	// Mungers will be called for raw protocol messages before sending them to
+	// journald.  The buffer can be mutated in-place, or a new buffer may be
+	// allocated.  A munger must not keep references to the input or output
+	// buffers.  Zero-length result or error causes the message to be dropped.
+	Mungers []func(context.Context, []byte) ([]byte, error)
+
 	Socket string
 }
 
@@ -71,6 +77,7 @@ func NewHandler(opts *HandlerOptions) (*Handler, error) {
 		h.delimiter = opts.Delimiter
 		h.timeFormat = opts.TimeFormat
 		h.msgPrefix = opts.Prefix
+		h.mungers = opts.Mungers
 		h.addIgnore(opts.IgnoreAttrs)
 	}
 
@@ -97,6 +104,7 @@ type Handler struct {
 	delimiter   string
 	timeFormat  string
 	msgPrefix   string
+	mungers     []func(context.Context, []byte) ([]byte, error)
 	ignore      map[ignoreKey]struct{}
 }
 
@@ -246,6 +254,17 @@ func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
 
 	b := *state.buf
 	binary.LittleEndian.PutUint64(b[messageOffset-8:], uint64(messageLen))
+
+	for _, f := range h.mungers {
+		var err error
+		b, err = f(ctx, b)
+		if cap(b) > cap(*state.buf) {
+			*state.buf = b
+		}
+		if err != nil || len(b) == 0 {
+			return err
+		}
+	}
 
 	if _, _, err := h.sock.WriteMsgUnix(b, nil, &h.addr); err != nil {
 		return h.sendViaFileIfTooLarge(err, b)
